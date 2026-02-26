@@ -97,7 +97,7 @@ def save_dbn(store, path: Path):
 
 def main(root: str, start: date, end: date):
     client = db.Historical()
-    symbols = load_contract_symbols(root)
+    symbols = load_active_contract_symbols(root, start, end)
 
     print(f"root={root} contracts={len(symbols)} start={start} end={end}")
     print("symbols:", symbols)

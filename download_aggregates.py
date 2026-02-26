@@ -8,6 +8,7 @@ from typing import Iterable
 import databento as db
 from tqdm import tqdm
 from dateutil.relativedelta import relativedelta
+from datetime import datetime
 
 DATASET = "GLBX.MDP3"
 SCHEMAS = ["ohlcv-1d", "statistics"]
@@ -16,6 +17,45 @@ RAW_ROOT = Path("/data/lake/raw/databento/GLBX.MDP3")
 CATALOG_DIR = Path("/data/lake/state/catalog")
 
 BATCH_SIZE = 200  # safe default; with ES you won't hit it
+
+
+
+
+def parse_d(s: str) -> date:
+    return date.fromisoformat(s)
+
+def overlaps(a0: date, a1: date, b0: date, b1: date) -> bool:
+    # treat d1/end as exclusive-like; overlap if ranges intersect
+    return a0 < b1 and b0 < a1
+
+def load_active_contract_symbols(root: str, start: date, end: date) -> list[str]:
+    p = latest_catalog_path(root)
+    data = json.loads(p.read_text())
+
+    resp = data.get("raw_response_parent_to_instrument_id", {})
+    result = resp.get("result", {}) if isinstance(resp, dict) else {}
+
+    active = []
+    for sym, rows in result.items():
+        if "-" in sym:
+            continue  # contracts only
+        if not isinstance(rows, list) or not rows:
+            continue
+        r0 = rows[0]
+        if not isinstance(r0, dict):
+            continue
+        d0 = r0.get("d0")
+        d1 = r0.get("d1")
+        if not d0 or not d1:
+            continue
+        s0, s1 = parse_d(d0), parse_d(d1)
+        if overlaps(s0, s1, start, end):
+            active.append(sym)
+
+    active = sorted(set(active))
+    if not active:
+        raise RuntimeError(f"No active contract symbols for root={root} in {start}..{end} using catalog {p}")
+    return active
 
 def month_ranges(start: date, end: date):
     cur = date(start.year, start.month, 1)

@@ -11,7 +11,7 @@ from dateutil.relativedelta import relativedelta
 from datetime import datetime
 
 DATASET = "GLBX.MDP3"
-SCHEMAS = ["ohlcv-1d", "statistics"]
+SCHEMAS = ["ohlcv-1m"]
 
 RAW_ROOT = Path("/data/lake/raw/databento/GLBX.MDP3")
 CATALOG_DIR = Path("/data/lake/state/catalog")

@@ -8,64 +8,19 @@ import databento as db
 
 DATASET = "GLBX.MDP3"
 
-def _extract_ids(mapping, parent: str) -> list[int]:
-    ids: list[int] = []
-
-    if isinstance(mapping, dict) and parent in mapping:
-        entries = mapping[parent]
-        if isinstance(entries, list):
-            for e in entries:
-                if isinstance(e, dict):
-                    v = e.get("instrument_id")
-                    if v is not None:
-                        ids.append(int(v))
-                else:
-                    # sometimes entries are already IDs
-                    try:
-                        ids.append(int(e))
-                    except Exception:
-                        pass
-    elif isinstance(mapping, list):
-        for x in mapping:
-            try:
-                ids.append(int(x))
-            except Exception:
-                pass
-
-    return sorted(set(ids))
-
-def _extract_symbols(mapping) -> dict[int, str]:
-    out: dict[int, str] = {}
-    # expected: { "<id>": [{"raw_symbol": "ESH4", ...}, ...] } OR { "<id>": "ESH4" } depending on version
-    if isinstance(mapping, dict):
-        for k, v in mapping.items():
-            try:
-                iid = int(k)
-            except Exception:
-                continue
-
-            if isinstance(v, list) and v:
-                # take the first mapping entry
-                e = v[0]
-                if isinstance(e, dict):
-                    sym = e.get("raw_symbol") or e.get("symbol")
-                    if sym:
-                        out[iid] = str(sym)
-            elif isinstance(v, dict):
-                sym = v.get("raw_symbol") or v.get("symbol")
-                if sym:
-                    out[iid] = str(sym)
-            elif isinstance(v, str):
-                out[iid] = v
-    return out
+def _get_result_block(resp: dict) -> dict:
+    # Databento resolve responses are shaped like: {"result": {...}, "symbols": [...], ...}
+    if isinstance(resp, dict) and "result" in resp and isinstance(resp["result"], dict):
+        return resp["result"]
+    return {}
 
 def discover(root: str, start: date, end: date, out_dir: Path) -> dict:
     client = db.Historical()
 
     parent = f"{root}.FUT"
 
-    # 1) parent -> instrument_id (SUPPORTED for GLBX.MDP3)
-    mapping_ids = client.symbology.resolve(
+    # 1) parent -> instrument_id (supported for GLBX.MDP3)
+    resp_ids = client.symbology.resolve(
         dataset=DATASET,
         symbols=[parent],
         stype_in="parent",
@@ -73,14 +28,29 @@ def discover(root: str, start: date, end: date, out_dir: Path) -> dict:
         start_date=start,
         end_date=end,
     )
-    instrument_ids = _extract_ids(mapping_ids, parent)
 
+    result_ids = _get_result_block(resp_ids)
+    rows = result_ids.get(parent, []) if isinstance(result_ids, dict) else []
+
+    instrument_ids: list[int] = []
+    for r in rows:
+        # each row looks like {"d0": "...", "d1": "...", "s": "3403"}
+        if isinstance(r, dict) and "s" in r:
+            try:
+                instrument_ids.append(int(r["s"]))
+            except Exception:
+                pass
+
+    instrument_ids = sorted(set(instrument_ids))
     if not instrument_ids:
-        raise RuntimeError(f"No instrument_ids discovered for {parent} in {start}..{end}. "
-                           f"Try widening the date window (e.g. 2014-01-01..2016-01-01).")
+        # dump response for debugging if still empty
+        raise RuntimeError(
+            f"No instrument_ids discovered for {parent} in {start}..{end}.\n"
+            f"Raw response was:\n{json.dumps(resp_ids, indent=2)[:4000]}"
+        )
 
-    # 2) instrument_id -> raw_symbol (SUPPORTED)
-    mapping_syms = client.symbology.resolve(
+    # 2) instrument_id -> raw_symbol (supported)
+    resp_syms = client.symbology.resolve(
         dataset=DATASET,
         symbols=[str(i) for i in instrument_ids],
         stype_in="instrument_id",
@@ -88,28 +58,42 @@ def discover(root: str, start: date, end: date, out_dir: Path) -> dict:
         start_date=start,
         end_date=end,
     )
-    id_to_symbol = _extract_symbols(mapping_syms)
 
-    # Keep both, because instrument_id is the best stable key
-    result = {
+    result_syms = _get_result_block(resp_syms)
+    id_to_raw: dict[int, str] = {}
+
+    # result_syms maps each input instrument_id (as string) to list of {..,"s":"ESH4"}
+    for iid_str, mappings in result_syms.items():
+        try:
+            iid = int(iid_str)
+        except Exception:
+            continue
+        if isinstance(mappings, list) and mappings:
+            m0 = mappings[0]
+            if isinstance(m0, dict) and "s" in m0:
+                id_to_raw[iid] = str(m0["s"])
+
+    out = {
         "root": root,
         "parent": parent,
         "start": start.isoformat(),
         "end": end.isoformat(),
         "instrument_ids": instrument_ids,
-        "id_to_raw_symbol": id_to_symbol,
+        "id_to_raw_symbol": id_to_raw,
+        "symbology_resolve_parent_to_id": resp_ids,   # keep for audit/debug
+        "symbology_resolve_id_to_raw": resp_syms,     # keep for audit/debug
     }
 
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{root}_catalog_{start.isoformat()}_{end.isoformat()}.json"
-    out_path.write_text(json.dumps(result, indent=2))
-    print(f"Wrote catalog: ids={len(instrument_ids)} symbols_mapped={len(id_to_symbol)} -> {out_path}")
-    return result
+    out_path.write_text(json.dumps(out, indent=2))
+    print(f"Wrote catalog: ids={len(instrument_ids)} raw_symbols={len(id_to_raw)} -> {out_path}")
+    return out
 
 if __name__ == "__main__":
     root = os.environ.get("ROOT", "ES")
-    start = date.fromisoformat(os.environ.get("START", "2015-01-01"))
-    end = date.fromisoformat(os.environ.get("END", "2015-01-05"))
+    start = date.fromisoformat(os.environ.get("START", "2014-01-01"))
+    end = date.fromisoformat(os.environ.get("END", "2016-01-01"))
 
     out_dir = Path("/data/lake/state/catalog")
     discover(root, start, end, out_dir)

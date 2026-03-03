@@ -334,7 +334,15 @@ def ingest_month_for_root(
         return
 
     # Universe discovery is cheap and also produces audit state files.
-    uni = resolve_active_contracts_for_month(client, dataset, root, m_start, m_end, write_state=True)
+    try:
+        uni = resolve_active_contracts_for_month(client, dataset, root, m_start, m_end, write_state=True)
+    except Exception as e:
+        msg = str(e)
+    # Databento returns 422 symbology_invalid_request when smart parent doesn't exist for that era
+        if "symbology_invalid_request" in msg and f"Could not resolve smart symbols: {root}.FUT" in msg:
+            print(f"[skip] {root} {_month_key(m_start)}: parent symbol not available in this window ({root}.FUT)")
+            return
+        raise
     if not uni.contracts_only:
         print(f"[skip] {root} {month}: no active contracts")
         # Mark schemas as done? No — leave as not-done; might become active in other windows.

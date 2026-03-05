@@ -32,6 +32,9 @@ Per-root parameterization:
   --rules "CL=4:10,NG=3:7,default=3:0"
 Meaning:
   confirm_days:min_hold_days
+
+Compatibility:
+  --force-window is accepted as an alias for --overwrite.
 """
 
 from __future__ import annotations
@@ -296,7 +299,6 @@ def build_continuous_for_month(
     )
 
     stable_keys = pl.DataFrame({"trade_date_utc": trade_dates, "symbol": stable_syms})
-
     chosen = stable_keys.join(df_all, on=["trade_date_utc", "symbol"], how="left")
 
     # Fallback to candidate row if stabilized row not found for some date
@@ -304,7 +306,6 @@ def build_continuous_for_month(
         cand_full = cand.rename({"symbol": "cand_symbol", "instrument_id": "cand_instrument_id"})
         tmp = chosen.join(cand_full, on=["trade_date_utc"], how="left")
 
-        # Build alt keys (use candidate symbol when stabilized join misses)
         miss = tmp["instrument_id"].is_null().to_list()
         alt_sym = [tmp["cand_symbol"][i] if miss[i] else tmp["symbol"][i] for i in range(len(miss))]
         alt_keys = pl.DataFrame({"trade_date_utc": tmp["trade_date_utc"], "symbol": alt_sym})
@@ -386,22 +387,28 @@ def compute_roll_events(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build continuous daily series for all roots (OI->Volume) with roll logging and per-root rules.")
+    ap = argparse.ArgumentParser(
+        description="Build continuous daily series for all roots (OI->Volume) with roll logging and per-root rules."
+    )
     ap.add_argument("--roots-file", default="roots.txt")
     ap.add_argument("--start", required=True, help="YYYY-MM-DD inclusive")
     ap.add_argument("--end", required=True, help="YYYY-MM-DD exclusive-ish")
+
     ap.add_argument("--overwrite", action="store_true")
+    # Compatibility alias (old flows)
+    ap.add_argument("--force-window", action="store_true", help="Alias for --overwrite (compatibility)")
+
     ap.add_argument("--root", default=None, help="Optional single-root run")
     ap.add_argument("--write-rolls", action="store_true", help="Write roll logs to parquet partitions")
 
-    # Global fallback if no --rules
     ap.add_argument("--confirm-days", type=int, default=3, help="Global fallback confirm days (used if --rules missing)")
     ap.add_argument("--min-hold-days", type=int, default=0, help="Global fallback min hold days (used if --rules missing)")
-
-    # Per-root rules
     ap.add_argument("--rules", default="", help='Per-root rules: "CL=4:10,NG=3:7,default=3:0"')
 
     args = ap.parse_args()
+
+    if args.force_window:
+        args.overwrite = True
 
     roots_file = Path(args.roots_file).expanduser().resolve()
     if not roots_file.exists():
@@ -432,6 +439,7 @@ def main() -> None:
         print(f"Rules:       {args.rules}")
     else:
         print(f"Rules:       (none) using global confirm={args.confirm_days} hold={args.min_hold_days}")
+    print(f"Overwrite:   {bool(args.overwrite)}")
     print()
 
     progress = load_progress()

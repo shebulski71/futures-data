@@ -1,11 +1,13 @@
+# ingest_daily_all_roots.py
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Iterable
 
 import databento as db
 import polars as pl
@@ -44,14 +46,17 @@ def read_roots(path: Path) -> list[str]:
     return roots
 
 
-def month_ranges(start: date, end: date) -> Iterable[Tuple[date, date]]:
+def month_ranges(start: date, end: date):
     """
-    Yields [month_start, month_end) ranges where end is exclusive-like.
+    Yield month windows clipped to [start, end).
     """
     cur = date(start.year, start.month, 1)
     while cur < end:
-        nxt = (cur + relativedelta(months=1))
-        yield cur, min(nxt, end)
+        nxt = cur + relativedelta(months=1)
+        m0 = max(cur, start)
+        m1 = min(nxt, end)
+        if m0 < m1:
+            yield m0, m1
         cur = nxt
 
 
@@ -115,13 +120,19 @@ def raw_outdir(dataset: str, schema: str, root: str, d: date) -> Path:
 
 
 def curated_outdir(schema: str, root: str, d: date) -> Path:
-    # normalize schema name for table directory
     table = f"futures_{schema.replace('-', '_')}"
     return CURATED_ROOT / table / f"root={root}" / f"year={d.year:04d}" / f"month={d.month:02d}"
 
 
 def normalized_outfile(table: str, root: str, d: date) -> Path:
-    return NORMALIZED_ROOT / table / f"root={root}" / f"year={d.year:04d}" / f"month={d.month:02d}" / "part-0000.parquet"
+    return (
+        NORMALIZED_ROOT
+        / table
+        / f"root={root}"
+        / f"year={d.year:04d}"
+        / f"month={d.month:02d}"
+        / "part-0000.parquet"
+    )
 
 
 # ----------------------------
@@ -132,8 +143,8 @@ class ActiveUniverse:
     root: str
     month_start: date
     month_end: date
-    contracts_only: list[str]               # raw symbols (e.g., ESH5)
-    raw_symbology_response: dict            # audit/debug
+    contracts_only: list[str]  # raw symbols (e.g., ESH5)
+    raw_symbology_response: dict  # audit/debug
 
 
 def resolve_active_contracts_for_month(
@@ -161,7 +172,9 @@ def resolve_active_contracts_for_month(
     )
 
     if not isinstance(resp, dict) or "result" not in resp or not isinstance(resp["result"], dict):
-        raise RuntimeError(f"Unexpected symbology response for {root} {month_start}: {str(resp)[:2000]}")
+        raise RuntimeError(
+            f"Unexpected symbology response for {root} {month_start}: {str(resp)[:2000]}"
+        )
 
     result = resp["result"]  # dict: child_symbol -> [{d0,d1,s}, ...]
 
@@ -244,8 +257,6 @@ def normalize_daily_month(root: str, month_start: date) -> None:
       - daily_bars_clean
       - daily_stats_pivoted
       - daily_joined
-
-    Join key uses UTC calendar day (ts_event.date()) for both bars and stats.
     """
     bars_dir = curated_outdir("ohlcv-1d", root, month_start)
     stats_dir = curated_outdir("statistics", root, month_start)
@@ -267,10 +278,19 @@ def normalize_daily_month(root: str, month_start: date) -> None:
         .sort(["instrument_id", "ts_event"])
         .with_columns(pl.col("ts_event").dt.date().alias("trade_date_utc"))
         .unique(subset=["instrument_id", "ts_event"], keep="last")
-        .select([
-            "instrument_id", "symbol", "trade_date_utc", "ts_event",
-            "open", "high", "low", "close", "volume",
-        ])
+        .select(
+            [
+                "instrument_id",
+                "symbol",
+                "trade_date_utc",
+                "ts_event",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]
+        )
         .collect()
     )
 
@@ -281,17 +301,30 @@ def normalize_daily_month(root: str, month_start: date) -> None:
         .with_columns(pl.col("ts_event").dt.date().alias("trade_date_utc"))
         .sort(["instrument_id", "trade_date_utc", "stat_type", "ts_event"])
         .unique(subset=["instrument_id", "trade_date_utc", "stat_type"], keep="last")
-        .with_columns([
-            pl.when(pl.col("stat_type") == 3).then(pl.col("price")).otherwise(None).alias("settlement_price"),
-            pl.when(pl.col("stat_type") == 9).then(pl.col("quantity")).otherwise(None).alias("open_interest"),
-            pl.when(pl.col("stat_type") == 6).then(pl.col("quantity")).otherwise(None).alias("cleared_volume"),
-        ])
+        .with_columns(
+            [
+                pl.when(pl.col("stat_type") == 3)
+                .then(pl.col("price"))
+                .otherwise(None)
+                .alias("settlement_price"),
+                pl.when(pl.col("stat_type") == 9)
+                .then(pl.col("quantity"))
+                .otherwise(None)
+                .alias("open_interest"),
+                pl.when(pl.col("stat_type") == 6)
+                .then(pl.col("quantity"))
+                .otherwise(None)
+                .alias("cleared_volume"),
+            ]
+        )
         .group_by(["instrument_id", "symbol", "trade_date_utc"])
-        .agg([
-            pl.max("settlement_price").alias("settlement_price"),
-            pl.max("open_interest").alias("open_interest"),
-            pl.max("cleared_volume").alias("cleared_volume"),
-        ])
+        .agg(
+            [
+                pl.max("settlement_price").alias("settlement_price"),
+                pl.max("open_interest").alias("open_interest"),
+                pl.max("cleared_volume").alias("cleared_volume"),
+            ]
+        )
         .collect()
     )
 
@@ -309,7 +342,9 @@ def normalize_daily_month(root: str, month_start: date) -> None:
     stats.write_parquet(stats_out, compression="zstd")
     joined.write_parquet(join_out, compression="zstd")
 
-    print(f"[normalize] {root} {month_start:%Y-%m}: bars={bars.height} stats={stats.height} joined={joined.height}")
+    print(
+        f"[normalize] {root} {month_start:%Y-%m}: bars={bars.height} stats={stats.height} joined={joined.height}"
+    )
 
 
 # ----------------------------
@@ -325,11 +360,14 @@ def ingest_month_for_root(
     transcode: bool,
     normalize: bool,
     progress: dict,
+    force_window: bool,
 ) -> None:
     month = _month_key(m_start)
 
-    # If both schemas done and normalized done, skip immediately.
-    if all(is_schema_done(progress, root, month, s) for s in SCHEMAS_DAILY) and (not normalize or is_normalized_done(progress, root, month)):
+    # If both schemas done and normalized done, skip immediately (unless forcing window).
+    if (not force_window) and all(
+        is_schema_done(progress, root, month, s) for s in SCHEMAS_DAILY
+    ) and (not normalize or is_normalized_done(progress, root, month)):
         print(f"[skip] {root} {month}: already complete (progress)")
         return
 
@@ -338,18 +376,19 @@ def ingest_month_for_root(
         uni = resolve_active_contracts_for_month(client, dataset, root, m_start, m_end, write_state=True)
     except Exception as e:
         msg = str(e)
-    # Databento returns 422 symbology_invalid_request when smart parent doesn't exist for that era
+        # Databento returns 422 symbology_invalid_request when smart parent doesn't exist for that era
         if "symbology_invalid_request" in msg and f"Could not resolve smart symbols: {root}.FUT" in msg:
             print(f"[skip] {root} {_month_key(m_start)}: parent symbol not available in this window ({root}.FUT)")
             return
         raise
+
     if not uni.contracts_only:
         print(f"[skip] {root} {month}: no active contracts")
-        # Mark schemas as done? No — leave as not-done; might become active in other windows.
         return
 
     for schema in SCHEMAS_DAILY:
-        if is_schema_done(progress, root, month, schema):
+        # IMPORTANT: schema-level progress skip must also be disabled when forcing a window
+        if (not force_window) and is_schema_done(progress, root, month, schema):
             print(f"[skip] {root} {month} {schema}: progress says done")
             continue
 
@@ -392,11 +431,12 @@ def ingest_month_for_root(
 
     # Normalization step
     if normalize:
-        if is_normalized_done(progress, root, month):
+        # IMPORTANT: normalization progress/output skips must be disabled when forcing a window
+        if (not force_window) and is_normalized_done(progress, root, month):
             print(f"[skip] {root} {month} normalize: progress says done")
         else:
             join_out = normalized_outfile("daily_joined", root, m_start)
-            if join_out.exists() and join_out.stat().st_size > 0:
+            if (not force_window) and join_out.exists() and join_out.stat().st_size > 0:
                 mark_normalized_done(progress, root, month)
                 save_progress_atomic(PROGRESS_PATH, progress)
                 print(f"[skip] {root} {month} normalize: output exists")
@@ -411,7 +451,9 @@ def ingest_month_for_root(
 # Main driver
 # ----------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Ingest daily futures truth layer for all roots (ohlcv-1d + statistics) with resume + idempotency.")
+    ap = argparse.ArgumentParser(
+        description="Ingest daily futures truth layer for all roots (ohlcv-1d + statistics) with resume + idempotency."
+    )
     ap.add_argument("--roots-file", type=str, default="roots.txt", help="Path to roots.txt (one root per line).")
     ap.add_argument("--dataset", type=str, default=DATASET_DEFAULT, help="Databento dataset, e.g. GLBX.MDP3")
     ap.add_argument("--start", type=str, required=True, help="Start date YYYY-MM-DD (inclusive)")
@@ -419,6 +461,12 @@ def main():
     ap.add_argument("--batch-size", type=int, default=200, help="Symbols per request batch")
     ap.add_argument("--no-transcode", action="store_true", help="Do not transcode DBN -> parquet")
     ap.add_argument("--no-normalize", action="store_true", help="Do not build normalized daily tables")
+    ap.add_argument("--strict", action="store_true", help="Exit non-zero if ANY month fails (default: soft-fail per root/month).")
+    ap.add_argument(
+        "--force-window",
+        action="store_true",
+        help="Ignore progress-based skips and ingest exactly the requested start/end window (still uses filesystem watermarks).",
+    )
     args = ap.parse_args()
 
     roots_path = Path(args.roots_file).expanduser().resolve()
@@ -437,11 +485,42 @@ def main():
     transcode = not args.no_transcode
     normalize = not args.no_normalize
 
+    # ---- Guard: ensure Databento key is present early (prevents confusing Prefect failures) ----
+    # databento client reads DATABENTO_API_KEY from env; we fail fast with a helpful message.
+    if not (getattr(db, "__version__", None) is None):
+        pass
+    # The Historical() constructor throws "invalid API key, was None" if missing.
+    # We'll pre-check env to make the error message obvious.
+    import os
+    if not os.environ.get("DATABENTO_API_KEY"):
+        print("[FATAL] DATABENTO_API_KEY is not set in the environment.", file=sys.stderr)
+        print("        If running under Prefect, set it as a Prefect Secret/Environment Variable for the worker job.", file=sys.stderr)
+        sys.exit(3)
+
     progress = load_progress(PROGRESS_PATH, args.dataset)
     client = db.Historical()
 
-    print(f"roots={len(roots)} dataset={args.dataset} start={start} end={end} transcode={transcode} normalize={normalize}")
+    print(
+        f"roots={len(roots)} dataset={args.dataset} start={start} end={end} "
+        f"transcode={transcode} normalize={normalize} force_window={bool(args.force_window)}"
+    )
     print(f"progress_file={PROGRESS_PATH}")
+
+    # --- Run report (JSON) ---
+    run_report = {
+        "generated_at_utc": datetime.utcnow().isoformat() + "Z",
+        "dataset": args.dataset,
+        "start": args.start,
+        "end": args.end,
+        "roots_file": str(roots_path),
+        "transcode": transcode,
+        "normalize": normalize,
+        "strict": bool(args.strict),
+        "force_window": bool(args.force_window),
+        "months_ok": 0,
+        "months_error": 0,
+        "errors": [],  # list of dicts: {root, month, error_type, error}
+    }
 
     # Iterate month by month to keep files manageable
     for root in roots:
@@ -460,16 +539,45 @@ def main():
                     transcode=transcode,
                     normalize=normalize,
                     progress=progress,
+                    force_window=bool(args.force_window),
                 )
+                run_report["months_ok"] += 1
             except Exception as e:
-                # Persist progress before continuing
                 save_progress_atomic(PROGRESS_PATH, progress)
+                run_report["months_error"] += 1
+                run_report["errors"].append(
+                    {
+                        "root": root,
+                        "month": month,
+                        "error_type": type(e).__name__,
+                        "error": str(e),
+                    }
+                )
                 print(f"[ERROR] {root} {month}: {type(e).__name__}: {e}")
+                if args.strict:
+                    # write report then fail immediately
+                    out = Path("/data/lake/state") / f"ingest_daily_run_{args.start}_to_{args.end}.json"
+                    out.write_text(json.dumps(run_report, indent=2))
+                    print(f"\nWrote run report: {out}")
+                    print("Strict mode: failing because at least one month failed.")
+                    sys.exit(1)
 
             # Save after each month for maximum restartability
             save_progress_atomic(PROGRESS_PATH, progress)
 
+    # Write the run report
+    out = Path("/data/lake/state") / f"ingest_daily_run_{args.start}_to_{args.end}.json"
+    out.write_text(json.dumps(run_report, indent=2))
+    print(f"\nWrote run report: {out}")
+    print(f"Summary: months_ok={run_report['months_ok']} months_error={run_report['months_error']}")
+
+    # Exit code policy
+    if run_report["months_ok"] == 0:
+        print("No successful months ingested. Failing.")
+        sys.exit(2)
+
     print("\nDone.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

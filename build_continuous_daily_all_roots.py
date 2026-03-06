@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -334,6 +334,25 @@ def build_continuous_for_month(
     last_iid = int(df_out["instrument_id"][-1])
     return df_out, last_symbol, last_iid
 
+def existing_output_max_date(path: Path) -> Optional[date]:
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    try:
+        df = pl.read_parquet(path, columns=["trade_date_utc"])
+        if df.is_empty():
+            return None
+        return df["trade_date_utc"].max()
+    except Exception:
+        return None    
+    
+
+
+def month_output_covers_requested_window(path: Path, requested_end_exclusive: date) -> bool:
+    needed_last_day = requested_end_exclusive - timedelta(days=1)
+    mx = existing_output_max_date(path)
+    return mx is not None and mx >= needed_last_day
+
+
 
 def compute_roll_events(
     root: str,
@@ -460,16 +479,15 @@ def main() -> None:
             mk = month_key(m_start)
             op = out_path(root, m_start)
             rp = roll_path(root, m_start)
-
-            if not args.overwrite and (is_done(progress, root, mk) or (op.exists() and op.stat().st_size > 0)):
-                if op.exists():
-                    try:
-                        existing = pl.read_parquet(op).sort("trade_date_utc")
-                        if existing.height > 0:
-                            prev_symbol = existing["symbol"][-1]
-                            prev_instrument_id = int(existing["instrument_id"][-1])
-                    except Exception:
-                        pass
+            
+            if not args.overwrite and month_output_covers_requested_window(op, _m_end):
+                try:
+                    existing = pl.read_parquet(op).sort("trade_date_utc")
+                    if existing.height > 0:
+                        prev_symbol = existing["symbol"][-1]
+                        prev_instrument_id = int(existing["instrument_id"][-1])
+                except Exception:
+                    pass
                 skipped += 1
                 continue
 

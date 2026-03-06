@@ -9,6 +9,7 @@ Parallel, incremental DBN -> parquet transcoding (IN-PLACE).
     .../foo.dbn -> .../foo.parquet
 - Skips files that already have a non-empty parquet output
 - Uses a process pool to speed up transcoding
+- Preserves ts_event by resetting the pandas index before converting to Polars
 
 Env vars:
   TRANSCODE_DATASET   (default: GLBX.MDP3)
@@ -53,12 +54,12 @@ def _already_done(out_path: Path) -> bool:
         return False
 
 
-def _transcode_one(args: Tuple[str, str, bool]) -> Tuple[str, bool, Optional[str]]:
+def _transcode_one(args: Tuple[str, bool]) -> Tuple[str, bool, Optional[str]]:
     """
     Worker: read DBN -> write parquet
     Returns (dbn_path, ok, err)
     """
-    dataset, dbn_str, force = args
+    dbn_str, force = args
     dbn_path = Path(dbn_str)
     out_path = _out_path_inplace(dbn_path)
 
@@ -72,11 +73,14 @@ def _transcode_one(args: Tuple[str, str, bool]) -> Tuple[str, bool, Optional[str
         store = db.DBNStore.from_file(str(dbn_path))
         df = store.to_df()
 
-        # Normalize to Polars
+        # Databento commonly returns pandas with ts_event in the index.
+        # Reset index first so ts_event is preserved as a real column.
         if not isinstance(df, pl.DataFrame):
+            if hasattr(df, "reset_index"):
+                df = df.reset_index()
             df = pl.from_pandas(df)
 
-        # Write parquet (zstd is a good tradeoff)
+        # Write parquet in place
         df.write_parquet(out_path, compression="zstd")
         return (dbn_str, True, None)
 
@@ -86,4 +90,57 @@ def _transcode_one(args: Tuple[str, str, bool]) -> Tuple[str, bool, Optional[str
 
 def main() -> None:
     dataset = (os.environ.get("TRANSCODE_DATASET", "GLBX.MDP3") or "").strip()
-    jobs = _env_int("TRANSCODE_JOBS", max(
+    jobs = _env_int("TRANSCODE_JOBS", max(1, (os.cpu_count() or 2) // 2))
+    force = _env_bool("TRANSCODE_FORCE", False)
+
+    base = RAW_BASE / dataset
+    if not base.exists():
+        raise SystemExit(f"Dataset path not found: {base}")
+
+    dbn_files = sorted(base.rglob("*.dbn"))
+    print(f"Found {len(dbn_files)} DBN files")
+
+    if not dbn_files:
+        print("Nothing to do.")
+        return
+
+    if not force:
+        todo = [p for p in dbn_files if not _already_done(_out_path_inplace(p))]
+    else:
+        todo = dbn_files
+
+    print(f"Need to transcode {len(todo)} files (force={force}, jobs={jobs})")
+
+    if not todo:
+        print("All parquet outputs already present.")
+        return
+
+    ok = 0
+    err = 0
+    failures: list[tuple[str, str]] = []
+
+    with ProcessPoolExecutor(max_workers=jobs) as ex:
+        futures = {
+            ex.submit(_transcode_one, (str(p), force)): p
+            for p in todo
+        }
+
+        for fut in as_completed(futures):
+            dbn_str, success, msg = fut.result()
+            if success:
+                ok += 1
+            else:
+                err += 1
+                failures.append((dbn_str, msg or "unknown error"))
+
+    print(f"Done. ok={ok} err={err}")
+
+    if failures:
+        print("\nFailures:")
+        for path, msg in failures[:100]:
+            print(f"  {path}: {msg}")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

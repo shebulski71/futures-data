@@ -94,8 +94,25 @@ def get_bars(root, start, end, timeframe, dataset, session_mode):
         session=session_mode
     )
 
-    bars = bars.sort_values("ts_event")
-    bars = bars.reset_index(drop=True)
+    # ---- convert to pandas if needed ----
+
+    try:
+        import polars as pl
+        if isinstance(bars, pl.DataFrame):
+            bars = bars.to_pandas()
+    except:
+        pass
+
+    try:
+        import pyarrow as pa
+        if isinstance(bars, pa.Table):
+            bars = bars.to_pandas()
+    except:
+        pass
+
+    # ---- ensure pandas operations work ----
+
+    bars = bars.sort_values("ts_event").reset_index(drop=True)
 
     return bars
 
